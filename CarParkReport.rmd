@@ -1,0 +1,118 @@
+---
+title: "TfL Car Parks"
+author: "óglaðr kjarr"
+date: "30/03/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      message = FALSE)
+
+library(knitr)
+library(tidyverse)
+library(lubridate)
+library(RPostgreSQL)
+```
+
+This document isn't so much for analysis, but just to show how to use data from the Postgres database filled as part of an Airflow DAG.
+
+# Introduction
+
+The data looked at comes from the TfL api that provides snapshots of car park information: how many spaces are there in total, how many are taken, grouped by disabled and non-disabled bay types.  This data has been aggregated and visualised below.
+
+```{r load_data}
+
+# Connect to database and retrieve data
+drv <- dbDriver("PostgreSQL")
+con <- dbConnect(drv, dbname = "tfl_data",
+                 host = "localhost", port = 5432,
+                 user = "postgres", password = 'postgres')
+rs <- dbSendQuery(con,"select * from tfl_data")
+data = fetch(rs,n=-1) ## return all elements 
+
+# Convert data to tibble, remove duplicates
+park_data <- 
+  as_tibble(data) %>% 
+  mutate(timestamp = strtoi(t_stamp),
+         timestamp = lubridate::origin + timestamp) %>% 
+  # Due to harvesting manual/harvesting overlap, there are some multiple entries
+  # for the same timestamp, which stops using spread later, so those are 
+  # arbitrarily removed using the row_number function.
+  group_by(timestamp, park_name, park_bay_type) %>% 
+  mutate(row_n = row_number()) %>% 
+  ungroup() %>% 
+  filter(row_n < 2) %>% 
+  select(-row_n, -t_stamp)
+```
+
+In the table below we get the overall number of spaces, by bay type, in the car parks within the dataset.  The amount of disabled spaces is around five percent of the total number of non-disabled spaces.
+
+```{r space_summary}
+
+space_summary <-
+  park_data %>% 
+  select(park_name, park_bay_type, park_bay_count) %>% 
+  distinct() %>% 
+  group_by(park_bay_type) %>% 
+  summarize(total_spaces = sum(park_bay_count))
+
+kable(space_summary)
+```
+
+Looking at the percentage of disabled bays in comparison to non-disabled bays individually, we can see that there are more at the four percent level, with a long tail.
+
+```{r space_summary_individual}
+
+space_summary_individual <-
+  park_data %>% 
+  select(park_name, 
+         park_bay_type,
+         park_bay_count) %>% 
+  distinct() %>% 
+  spread(park_bay_type, park_bay_count) %>% 
+  mutate(percent_disabled = (Disabled / `Pay and Display Parking`) * 100)
+
+ggplot(space_summary_individual) +
+  geom_histogram(aes(percent_disabled), fill = 'blue', alpha=0.4, binwidth = 1) +
+  ggtitle('Disabled Spaces as Percentage of Pay & Display Spaces') +
+  xlab('Percent')
+```
+
+Looking at the percentage of spaces used over time makes it look that there are many disabled bays sitting empty compared to non-disabled bays.
+
+```{r ts_by_type_summary}
+
+ts_by_bay_type <-
+  park_data %>% 
+  group_by(timestamp, park_bay_type) %>% 
+  summarize(total_taken = sum(park_bay_occupied),
+            total_free = sum(park_bay_free),
+            total_available = sum(park_bay_count),
+            perc_used = (total_taken/total_available) * 100)
+
+ggplot(ts_by_bay_type) +
+  geom_line(aes(x = timestamp,
+                y = perc_used,
+                group = park_bay_type,
+                color = park_bay_type))
+```
+
+However, in the very busy plot below, it is shown that some car parks have near total occupancy of disabled bays, while others have very little occupancy, and that the aggregate above is blending this information together.
+
+```{r ts_by_type_disabled}
+
+ts_of_disabled <-
+  park_data %>% 
+  filter(park_bay_type == 'Disabled') %>% 
+  mutate(perc_used = (park_bay_occupied/park_bay_count)*100)
+
+ggplot(ts_of_disabled,
+       aes(x = timestamp, 
+           y = perc_used,
+           color = park_name)) +
+  geom_point()+
+  geom_jitter() +
+  geom_line(aes(group = park_name))
+```
